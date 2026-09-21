@@ -509,6 +509,7 @@ defineExpose({ beforeLeave: flushAutoSave, loading, saving })
 .scheduled-shell:not(.open) .list-pane {
   max-width: 820px;
   margin: 0 auto;
+  margin-top: 20px;
   padding-bottom: 24px;
 }
 

@@ -354,7 +354,6 @@ const confirmDeleteProject = (project) => {
   min-height: 0;
   flex: 1;
   overflow-y: auto;
-  padding-right: 2px;
   scrollbar-width: thin;
 }
 .project-history-group {
