@@ -307,42 +307,6 @@
       @ok="configureGraphBuild"
     >
       <a-form layout="vertical">
-        <a-alert
-          v-if="isEditingGraphConfig"
-          class="config-warning"
-          type="warning"
-          show-icon
-          message="修改配置仅影响后续构建；已构建的图谱不会自动重算，如需一致请重置后重新抽取。抽取器类型创建后不可修改。"
-        />
-        <a-form-item label="抽取器类型">
-          <div class="extractor-type-cards" role="radiogroup" aria-label="抽取器类型">
-            <div
-              v-for="option in extractorTypeOptions"
-              :key="option.value"
-              class="extractor-type-card"
-              :class="{
-                active: graphConfigForm.extractor_type === option.value,
-                disabled: isEditingGraphConfig || option.disabled
-              }"
-              role="radio"
-              :aria-checked="graphConfigForm.extractor_type === option.value"
-              :aria-disabled="isEditingGraphConfig || option.disabled"
-              :tabindex="isEditingGraphConfig || option.disabled ? -1 : 0"
-              @click="selectExtractorType(option)"
-              @keydown.enter.prevent="selectExtractorType(option)"
-              @keydown.space.prevent="selectExtractorType(option)"
-            >
-              <div class="card-header">
-                <component :is="option.icon" class="type-icon" />
-                <span class="type-title">{{ option.label }}</span>
-              </div>
-              <div class="card-description">{{ option.description }}</div>
-              <div v-if="option.helper" class="card-helper" :class="{ warning: option.disabled }">
-                {{ option.helper }}
-              </div>
-            </div>
-          </div>
-        </a-form-item>
         <a-form-item label="模型">
           <ModelSelectorComponent
             :model_spec="graphConfigForm.model_spec"
@@ -351,6 +315,9 @@
           />
         </a-form-item>
         <a-form-item label="Schema">
+          <div v-if="isEditingGraphConfig" class="schema-description">
+            修改配置仅影响后续构建；已构建的图谱不会自动重算，如需一致请重置后重新抽取。抽取器类型创建后不可修改。
+          </div>
           <a-textarea
             v-model:value="graphConfigForm.schema"
             :rows="6"
@@ -430,9 +397,7 @@ import {
   Search,
   Loader2,
   Database,
-  Network,
-  BrainCircuit,
-  ScanText
+  Network
 } from '@lucide/vue'
 import GraphCanvas from '@/components/GraphCanvas.vue'
 import GraphDetailPanel from '@/components/GraphDetailPanel.vue'
@@ -485,25 +450,6 @@ const failedChunkSamplesLoading = ref(false)
 const failedChunkSamples = ref([])
 const activeFailedChunkKey = ref('')
 let buildStatusPollTimer = null
-
-const extractorTypeOptions = [
-  {
-    value: 'llm',
-    label: 'LLM',
-    description: '使用大模型按 Schema 抽取实体和关系',
-    helper: '当前唯一支持的图谱抽取方式',
-    icon: BrainCircuit,
-    disabled: false
-  },
-  {
-    value: 'more',
-    label: '更多',
-    description: '更多抽取方式正在拓展中',
-    helper: '拓展中',
-    icon: ScanText,
-    disabled: true
-  }
-]
 
 const isBuildActive = computed(() => {
   const s = graphBuildStatus.value?.build_task_status
@@ -593,7 +539,6 @@ watch(
 )
 const DEFAULT_EXTRACTION_TIMEOUT_SECONDS = 60
 const graphConfigForm = reactive({
-  extractor_type: 'llm',
   model_spec: '',
   schema: '',
   concurrency_count: 50,
@@ -674,7 +619,6 @@ const parseModelParams = () => {
 const fillGraphConfigForm = () => {
   const config = graphBuildStatus.value?.config
   const options = config?.extractor_options || {}
-  graphConfigForm.extractor_type = 'llm'
   graphConfigForm.model_spec = options.model_spec || configStore.config?.default_model || ''
   graphConfigForm.schema = options.schema || ''
   graphConfigForm.concurrency_count = Number(options.concurrency_count || 50)
@@ -687,11 +631,6 @@ const fillGraphConfigForm = () => {
 const openGraphConfig = () => {
   fillGraphConfigForm()
   showGraphConfig.value = true
-}
-
-const selectExtractorType = (option) => {
-  if (isEditingGraphConfig.value || option.disabled) return
-  graphConfigForm.extractor_type = option.value
 }
 
 const buildExtractorOptions = () => {
@@ -1165,7 +1104,8 @@ onUnmounted(() => {
     align-items: center;
     padding: 6px 4px;
     border-radius: 4px;
-    background: var(--gray-50);
+    background: var(--gray-0);
+    outline: 1px solid var(--gray-100);
 
     &.is-clickable {
       cursor: pointer;
@@ -1243,83 +1183,11 @@ onUnmounted(() => {
   word-break: break-word;
 }
 
-.config-warning {
-  margin-bottom: 16px;
-}
-
-.extractor-type-cards {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px;
-
-  .extractor-type-card {
-    border: 1px solid var(--gray-150);
-    border-radius: 8px;
-    padding: 14px;
-    cursor: pointer;
-    transition: all 0.2s ease;
-    background: var(--gray-0);
-
-    &:hover {
-      border-color: var(--main-color);
-    }
-
-    &.active {
-      border-color: var(--main-color);
-      background: var(--main-10);
-      box-shadow: 0 0 0 1px var(--main-20);
-
-      .type-icon {
-        color: var(--main-color);
-      }
-    }
-
-    &.disabled {
-      cursor: not-allowed;
-      opacity: 0.72;
-      background: var(--gray-50);
-
-      &:hover {
-        border-color: var(--gray-150);
-      }
-    }
-
-    .card-header {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      margin-bottom: 10px;
-    }
-
-    .type-icon {
-      width: 20px;
-      height: 20px;
-      color: var(--main-color);
-      flex-shrink: 0;
-    }
-
-    .type-title {
-      font-size: 15px;
-      font-weight: 600;
-      color: var(--gray-800);
-    }
-
-    .card-description {
-      font-size: 13px;
-      color: var(--gray-600);
-      line-height: 1.5;
-    }
-
-    .card-helper {
-      margin-top: 8px;
-      font-size: 12px;
-      color: var(--gray-500);
-
-      &.warning {
-        color: var(--color-warning-500);
-      }
-    }
-  }
+.schema-description {
+  margin-bottom: 8px;
+  color: var(--gray-600);
+  font-size: 13px;
+  line-height: 1.5;
 }
 
 .form-grid.two-columns {
