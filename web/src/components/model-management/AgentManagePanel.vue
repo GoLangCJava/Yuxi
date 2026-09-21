@@ -85,10 +85,24 @@ const loadAgents = async () => {
   try {
     const response = await agentApi.getAgents({ includeSubagents: true })
     managedAgents.value = (response.agents || []).map(normalizeAgent)
-  } catch (error) {
-    message.error(error.message || '加载智能体失败')
   } finally {
     agentLoading.value = false
+  }
+}
+
+const refreshAgents = async () => {
+  try {
+    await loadAgents()
+  } catch (error) {
+    message.error(error.message || '加载智能体失败')
+  }
+}
+
+const handleAgentSaved = async () => {
+  try {
+    await refreshAgentLists()
+  } catch (error) {
+    message.error(error.message || '刷新智能体列表失败')
   }
 }
 
@@ -134,13 +148,17 @@ const deleteAgent = async (agent) => {
 }
 
 onMounted(async () => {
-  await Promise.all([loadAgentBackends(), loadAgents()])
+  const results = await Promise.allSettled([loadAgentBackends(), loadAgents()])
+  const failedLoad = results.find((result) => result.status === 'rejected')
+  if (failedLoad) {
+    message.error(failedLoad.reason?.message || '加载智能体失败')
+  }
 })
 
 defineExpose({
   loading: agentLoading,
   stats: agentStats,
-  refresh: loadAgents
+  refresh: refreshAgents
 })
 </script>
 
@@ -150,7 +168,7 @@ defineExpose({
       <template #actions>
         <a-button
           class="lucide-icon-btn"
-          @click="loadAgents"
+          @click="refreshAgents"
           :disabled="agentLoading"
           aria-label="刷新智能体"
         >
@@ -243,7 +261,7 @@ defineExpose({
     <AgentEditModal
       ref="agentEditModalRef"
       :backend-options="agentBackendOptions"
-      @saved="refreshAgentLists"
+      @saved="handleAgentSaved"
     />
   </div>
 </template>
