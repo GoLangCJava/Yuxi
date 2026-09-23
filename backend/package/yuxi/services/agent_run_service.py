@@ -43,7 +43,6 @@ from yuxi.services.langfuse_service import get_trace_url_by_id_async
 from yuxi.services.run_queue_service import (
     build_run_event_envelope,
     get_arq_pool,
-    get_last_run_stream_seq,
     list_recent_run_stream_events,
     list_run_stream_events,
     normalize_after_seq,
@@ -999,11 +998,7 @@ async def stream_agent_run_events(
                 and not bool(getattr(run, "runtime_cleanup_pending", False))
                 and not events
             ):
-                terminal_seq = last_seq
-                if terminal_seq in {"", "0-0"}:
-                    terminal_seq = await get_last_run_stream_seq(run_id)
-                if terminal_seq in {"", "0-0"}:
-                    terminal_seq = None
+                # 数据库补发通知没有 Redis ID，不能复用已消费事件的游标。
                 terminal_envelope = build_run_event_envelope(
                     run_id=run_id,
                     thread_id=run.conversation_thread_id,
@@ -1016,7 +1011,6 @@ async def stream_agent_run_events(
                 yield format_sse(
                     terminal_envelope,
                     event="end",
-                    event_id=terminal_seq,
                 )
                 return
 
