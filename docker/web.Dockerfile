@@ -12,7 +12,7 @@ COPY ./web/pnpm-lock.yaml* ./
 COPY ./web/pnpm-workspace.yaml ./
 
 # 安装依赖（--frozen-lockfile 保证 dev 与 build/CI 三处依赖与 pnpm-lock.yaml 一致，避免漂移）
-RUN pnpm install --frozen-lockfile --registry=https://registry.npmmirror.com
+# RUN pnpm install --frozen-lockfile --registry=https://registry.npmmirror.com --config.fetch-timeout=600000 --config.fetch-retries=10
 
 # 复制源代码
 COPY ./web .
@@ -35,7 +35,7 @@ COPY ./web/pnpm-lock.yaml* ./
 COPY ./web/pnpm-workspace.yaml ./
 
 # 安装依赖
-RUN pnpm install --frozen-lockfile --registry=https://registry.npmmirror.com
+RUN pnpm install --frozen-lockfile --registry=https://registry.npmmirror.com --config.fetch-timeout=600000 --config.fetch-retries=10
 
 # 复制源代码并构建
 COPY ./web .

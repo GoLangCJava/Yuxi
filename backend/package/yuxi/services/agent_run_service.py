@@ -146,6 +146,7 @@ async def resolve_agent_run_config(
 
 
 def _build_run_response(run) -> dict:
+    """把 Run 行压缩成对外的最小响应体，含 SSE 入口地址。"""
     return {
         "run_id": run.id,
         "thread_id": run.conversation_thread_id,
@@ -156,6 +157,7 @@ def _build_run_response(run) -> dict:
 
 
 def _validate_resume_input(resume: object) -> None:
+    """校验 resume payload 的 decisions 结构，非法时直接 422。"""
     if not isinstance(resume, dict) or "decisions" not in resume:
         return
     decisions = resume.get("decisions")
@@ -167,6 +169,7 @@ def _validate_resume_input(resume: object) -> None:
 
 
 def _compact_message_dict(message: dict) -> dict:
+    """精简 SSE 上行的消息字段，仅保留前端展示与附件元信息。"""
     compact = {
         key: message[key] for key in ("id", "role", "content", "type", "message_type") if message.get(key) is not None
     }
@@ -177,6 +180,7 @@ def _compact_message_dict(message: dict) -> dict:
 
 
 def _compact_semantic_stream_event(stream_event: dict) -> dict:
+    """按事件类型精简语义流事件字段，去掉 thread_id/namespace 等冗余。"""
     event_type = stream_event.get("type")
     if event_type == "message_delta":
         return {
@@ -199,6 +203,7 @@ def _compact_semantic_stream_event(stream_event: dict) -> dict:
 
 
 def _compact_tool_stream_event(event: dict) -> dict:
+    """精简 tool 事件，保留 method 与 data 中的关键字段。"""
     compact = {key: event[key] for key in ("method",) if event.get(key)}
     data = event.get("data")
     if isinstance(data, dict):
@@ -213,6 +218,7 @@ def _compact_tool_stream_event(event: dict) -> dict:
 
 
 def _compact_stream_chunk(chunk: dict) -> dict:
+    """精简 chunk 主体字段并递归压缩内嵌 msg/stream_event/event。"""
     compact = {
         key: chunk[key]
         for key in (
@@ -242,6 +248,7 @@ def _compact_stream_chunk(chunk: dict) -> dict:
 
 
 def _request_id_from_chunk(chunk: object) -> str | None:
+    """从单个 chunk 中抽取 request_id，兼容顶层与 msg.extra_metadata 两种位置。"""
     if not isinstance(chunk, dict):
         return None
     request_id = chunk.get("request_id")
@@ -257,6 +264,7 @@ def _request_id_from_chunk(chunk: object) -> str | None:
 
 
 def _request_id_from_payload(payload: object) -> str | None:
+    """从事件 payload 抽取 request_id，依次查顶层、chunk、items 列表。"""
     if not isinstance(payload, dict):
         return None
     request_id = payload.get("request_id")
@@ -275,6 +283,7 @@ def _request_id_from_payload(payload: object) -> str | None:
 
 
 def _compact_run_event_payload(event_type: str, payload: dict | None) -> dict:
+    """按事件类型精简 payload，messages 事件递归压缩其 items/chunk。"""
     if not isinstance(payload, dict):
         return {}
 
@@ -295,12 +304,14 @@ def _compact_run_event_payload(event_type: str, payload: dict | None) -> dict:
 
 
 def _is_empty_agent_state(agent_state: object) -> bool:
+    """判断 agent_state 是否全字段为空，用于丢弃无意义的 agent_state 事件。"""
     if not isinstance(agent_state, dict):
         return False
     return all(not value for value in agent_state.values())
 
 
 def _compact_run_event_envelope(envelope: dict) -> dict | None:
+    """精简事件外层 envelope，并丢弃空的 agent_state 自定义事件。"""
     event_type = str(envelope.get("event") or "")
     payload = envelope.get("payload")
     if event_type == "metadata":
@@ -488,6 +499,7 @@ async def create_resume_run_view(
 
 
 async def _commit_and_enqueue(db: AsyncSession, run_id: str) -> None:
+    """统一封装「先 commit 再 enqueue」的 PG-before-ARQ 不变量。"""
     await db.commit()
     await enqueue_agent_run(run_id)
 
@@ -525,6 +537,7 @@ def _same_run_request_scope(
 
 
 def _run_busy_exception(*, active_run, agent_slug: str, conversation_thread_id: str) -> HTTPException:
+    """构造线程已存在活跃 run 的 409 响应，含 active_run 信息供前端提示。"""
     return HTTPException(
         status_code=409,
         detail={
@@ -737,12 +750,14 @@ async def prepare_agent_run_creation_scope(
 
 
 async def enqueue_agent_run(run_id: str) -> None:
-    """把已持久化的 run 投递到后台 worker 队列。"""
+    """把已持久化的 run 投递到 ARQ；调用方必须先完成 PG commit，避免 worker 读到未提交 run。"""
     queue = await get_arq_pool()
+    # _job_id 用 run 唯一前缀作幂等键，重复投递由 ARQ 去重，不会创建重复执行。
     await queue.enqueue_job("process_agent_run", run_id, _job_id=f"run:{run_id}")
 
 
 async def get_agent_run_view(*, run_id: str, current_uid: str, db: AsyncSession) -> dict:
+    """读取单个 run 的对外视图，依赖 repository 层做 current_uid 鉴权。"""
     repo = AgentRunRepository(db)
     run = await repo.get_run_for_user(run_id, str(current_uid))
     if not run:
@@ -854,6 +869,8 @@ async def request_cancel_agent_run(
     )
     if run is None:
         raise HTTPException(status_code=404, detail="运行任务不存在")
+    # 两段式取消：先在 PG 标记 cancel_requested（业务状态最终落在 PG），
+    # 提交后再向 Redis 发布取消信号唤醒正在执行的 worker。
     await db.commit()
     await publish_cancel_signals(cancelled_ids)
     return run
@@ -900,9 +917,10 @@ async def stream_agent_run_events(
     current_uid: str,
     verbose: bool = True,
 ) -> AsyncIterator[str]:
-    """按 SSE 格式读取 run 事件流；终结事件缺失时根据数据库状态补发 end。"""
+    """按 SSE 读 run 事件流；current_uid 鉴权 fail-closed，after_seq 支持 Last-Event-ID 续传，终结事件缺失时用 PG 终态补 end。"""
     started_at = utc_now_naive()
     last_heartbeat_ts = started_at
+    # after_seq 来自客户端 Last-Event-ID，normalize 后作为 Redis Stream 游标起点。
     last_seq = normalize_after_seq(after_seq)
     started_monotonic = monotonic()
     last_event_at = started_monotonic
@@ -931,6 +949,7 @@ async def stream_agent_run_events(
 
         while True:
             try:
+                # 以 last_seq 为 XREAD 游标拉取后续事件；返回空表示当前无新事件。
                 events = await list_run_stream_events(run_id, after_seq=last_seq, limit=200)
             except Exception as e:
                 logger.warning(f"Run SSE redis error for run {run_id}: {e}")
@@ -958,6 +977,7 @@ async def stream_agent_run_events(
                     envelope = _compact_run_event_envelope(envelope)
                     if envelope is None:
                         continue
+                # event_id=seq 让客户端断线重连时通过 Last-Event-ID 续传。
                 yield format_sse(envelope, event=event_type, event_id=seq)
                 if event_type == "end":
                     emitted_terminal = True
@@ -987,6 +1007,8 @@ async def stream_agent_run_events(
                     return
                 next_status_check_at = monotonic() + RUN_SSE_STATUS_POLL_SECONDS
 
+            # PG 终态兜底：Redis Stream 可能丢失终结事件，当 run 已终态且本轮无新事件时，
+            # 用 PG 真实状态补发 end，确保 SSE 客户端能正常关闭。
             if (
                 run.status in TERMINAL_RUN_STATUSES
                 and not bool(getattr(run, "runtime_cleanup_pending", False))
@@ -1016,10 +1038,12 @@ async def stream_agent_run_events(
             now = utc_now_naive()
             elapsed_seconds = (now - started_at).total_seconds()
             heartbeat_elapsed = (now - last_heartbeat_ts).total_seconds()
+            # 周期性心跳，防止代理层因空闲断连。
             if heartbeat_elapsed >= SSE_HEARTBEAT_SECONDS:
                 yield format_heartbeat()
                 last_heartbeat_ts = now
 
+            # 超过最大连接时长主动结束，客户端需通过 Last-Event-ID 重连续传。
             if elapsed_seconds >= SSE_MAX_CONNECTION_MINUTES * 60:
                 return
 
@@ -1030,6 +1054,7 @@ async def stream_agent_run_events(
                 idle_seconds = monotonic() - last_event_at
                 poll_interval = _next_run_sse_poll_interval(poll_interval, idle_seconds)
     except asyncio.CancelledError:
+        # 客户端断开：直接结束，不补发终态。
         return
 
 

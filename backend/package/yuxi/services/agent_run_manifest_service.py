@@ -49,7 +49,11 @@ def canonical_json(payload: Any) -> str:
 
 
 def compute_manifest_fingerprint(manifest: dict) -> str:
-    """计算运行清单的 SHA-256 指纹。"""
+    """计算运行清单的 SHA-256 指纹。
+
+    先经 canonical_json 做键排序序列化，确保同语义 manifest 的字段顺序
+    不影响指纹；指纹固化后与本次 Run 绑定，不可重算或覆盖。
+    """
     return hashlib.sha256(canonical_json(manifest).encode("utf-8")).hexdigest()
 
 
@@ -98,6 +102,7 @@ def build_manifest_payload(
             "skills": skill_entries,
         },
         "limits": limits,
+        # 完整 normalized_context（含 prompt 等长内容）只以摘要形式进入 manifest，避免固化全文与潜在敏感内容。
         "config_digest": compute_config_digest(normalized_context),
         "code_revision": code_revision or "unresolved",
     }
@@ -109,6 +114,7 @@ def build_skill_manifest_entries(config: dict, skill_scope: dict) -> list[dict]:
     entries = []
     for slug in slugs:
         metadata = skill_scope["skill_metadata"][slug]
+        # 个人 Skill 受用户作用域约束，无可固化的全局版本/内容哈希；仅保留 slug 与预加载摘要。
         personal = metadata["source_scope"] == PERSONAL_SKILL_SOURCE_TYPE
         entry = {
             "slug": slug,
@@ -148,9 +154,11 @@ async def prepare_run_execution(
 
     context = backend.context_schema()
     configured = (agent_item.config_json or {}).get("context") or {}
+    # 仅 dataclass 标记为 configurable 的字段可进入 manifest；身份/租约/路径类字段不在此集合，故不进 normalized_context。
     configurable_fields = {item.name for item in fields(context) if item.metadata.get("configurable", True)}
     context.update_config(configured)
     payload = run.input_payload
+    # 以下为身份/租约/路径类字段，由 PG 行与 worker 派生，不属于用户可配置项，故不进入 manifest。
     context.update(
         {
             "thread_id": run.conversation_thread_id,
@@ -178,6 +186,7 @@ async def prepare_run_execution(
 
     # 身份、租约与路径不属于可配置字段；完整 prompt 仅通过摘要进入 manifest。
     effective_config = {name: getattr(context, name) for name in configurable_fields}
+    # manifest 从 runtime 已 prepare 的 Context 派生而非原始 config，确保指纹与本次实际执行的图严格一致。
     manifest = build_manifest_payload(
         run_type=run.run_type,
         agent_slug=run.agent_slug,

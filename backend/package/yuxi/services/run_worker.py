@@ -69,9 +69,13 @@ from yuxi.utils.thread_utils import extract_thread_id
 
 LOADING_FLUSH_INTERVAL_MS = 100
 LOADING_FLUSH_MAX_CHARS = 512
+# Redis 取消信号轮询频率；与 durable 轮询拉开差距，Redis 丢信号时 PG 兜底仍能 fail-closed。
 RUN_CANCEL_POLL_SECONDS = 0.2
+# 兜底取消轮询频率；慢于 Redis 轮询避免无谓 PG 读，但远小于 lease TTL。
 RUN_DURABLE_CANCEL_POLL_SECONDS = 1.0
+# lease TTL；必须显著大于 heartbeat 间隔，否则续租抖动会被 reconciler 误判为失联。
 RUN_LEASE_SECONDS = 120
+# heartbeat 续租频率；小于 lease TTL 才能在单次失败后仍有恢复窗口。
 RUN_HEARTBEAT_SECONDS = 30
 SUPPORTED_RUN_TYPES = {"chat", "resume", "subagent"}
 WORKER_ID = f"worker-{uuid.uuid4().hex}"
@@ -104,12 +108,14 @@ async def _validate_run_workdir_binding(run: AgentRun) -> AuthorizedWorkdir:
             uid=str(run.uid),
             db=db,
         )
+        # Run 的 Conversation 必须与 binding 解析出来的同一身份；任何不一致都拒绝执行。
         if int(binding.conversation_id) != int(run.conversation_id):
             raise NonRetryableRunError("AgentRun 的 Conversation 身份不一致")
 
         persisted_scope = str(run.runtime_scope_id or "").strip()
         if not persisted_scope:
             raise NonRetryableRunError("AgentRun 缺少 runtime scope")
+        # chat/resume 的 scope 必须等于线程 ID，禁止跨线程复用 runtime。
         if run.run_type in {"chat", "resume"} and persisted_scope != str(run.conversation_thread_id):
             raise NonRetryableRunError(f"{str(run.run_type).capitalize()} AgentRun 的 runtime scope 非法")
 
@@ -133,6 +139,7 @@ async def _validate_run_workdir_binding(run: AgentRun) -> AuthorizedWorkdir:
                 uid=str(run.uid),
                 db=db,
             )
+            # SubAgent 必须挂在创建者的执行树上：scope、Conversation、project 三者一致。
             if (
                 persisted_scope != str(creator_run.runtime_scope_id)
                 or int(creator_binding.conversation_id) != int(creator_run.conversation_id)
@@ -159,6 +166,7 @@ class RunContext:
     lease_lost: bool = False
 
     async def start(self) -> None:
+        """启动取消监听与 lease heartbeat；调用方负责在 finally 中 close。"""
         if self._watch_task is None:
             self._watch_task = asyncio.create_task(self._watch_cancel_signal())
         if self._durable_cancel_task is None:
@@ -167,6 +175,7 @@ class RunContext:
             self._heartbeat_task = asyncio.create_task(self._heartbeat_lease())
 
     async def close(self) -> None:
+        """取消并等待所有后台任务，避免 worker 退出后仍有 lease 续租残留。"""
         tasks = [
             task for task in (self._watch_task, self._durable_cancel_task, self._heartbeat_task) if task is not None
         ]
@@ -185,6 +194,7 @@ class RunContext:
         return self.cancel_event.is_set()
 
     async def _watch_cancel_signal(self) -> None:
+        """高频轮询 Redis 取消信号；触发后置位 cancel_event 让执行链快速中止。"""
         await wait_for_cancel_signal(
             self.run_id,
             poll_interval_seconds=RUN_CANCEL_POLL_SECONDS,
@@ -214,6 +224,8 @@ class RunContext:
                 continue
 
     async def _heartbeat_lease(self) -> None:
+        """周期续租；owner 失效时置 lease_lost 并 fail-closed 触发执行中止。"""
+
         while not self.cancel_event.is_set():
             await asyncio.sleep(RUN_HEARTBEAT_SECONDS)
             if self.cancel_event.is_set():
@@ -227,6 +239,7 @@ class RunContext:
                 logger.error(f"Failed to renew AgentRun lease: run={self.run_id}", exc_info=True)
                 renewed = False
             if not renewed:
+                # 续租失败视为 lease 失守；置位后由 CancelledError 收敛，避免静默越权继续执行。
                 self.lease_lost = True
                 self.cancel_event.set()
                 return
@@ -352,8 +365,10 @@ async def _finish_execution_tree_children(run: AgentRun) -> None:
     """收敛 execution tree 后代的数据库终态并通知其停止执行。"""
     async with pg_manager.get_async_session_context() as db:
         repo = AgentRunRepository(db)
+        # 后代终态必须在同一事务内原子转换，避免留下活跃但无人拥有的 SubAgent Run。
         descendants = await repo.cancel_active_execution_tree_descendants(run)
         await db.commit()
+    # 取消信号在事务外发布，避免 Redis 发布与 PG 终态不一致时信号丢失。
     await publish_cancel_signals([run_id for run_id, _thread_id in descendants])
 
 
@@ -397,6 +412,7 @@ async def _flush_writer_best_effort(writer: ChunkedEventWriter) -> None:
 
 
 async def mark_run_running(run_id: str, worker_id: str) -> bool:
+    """尝试 claim 当前 Run 的执行 ownership；owner 已存在或已终态时返回 False。"""
     async with pg_manager.get_async_session_context() as db:
         repo = AgentRunRepository(db)
         _, acquired = await repo.mark_running(
@@ -458,9 +474,11 @@ async def mark_run_terminal(
     token_usage: dict | None = None,
     worker_id: str | None = None,
 ):
+    """在唯一 owner 持有下原子收敛 Run 终态并取消 execution tree 后代。"""
     cancelled_descendants: list[tuple[str, str]] = []
     async with pg_manager.get_async_session_context() as db:
         repo = AgentRunRepository(db)
+        # 终态写入与后代取消在同一事务内完成；并发 owner 不会重复触发终态事件。
         run, changed = await repo.set_terminal_status(
             run_id,
             status=status,
@@ -533,6 +551,7 @@ async def prepare_and_record_run_execution(
             worker_id=worker_id,
             workdir_binding=workdir_binding,
         )
+        # 指纹固化后 manifest 即 write-once；重试只允许复用同一指纹的资产。
         fingerprint = compute_manifest_fingerprint(result.manifest)
         persisted_run, recorded = await AgentRunRepository(db).record_run_manifest(
             run.id,
@@ -572,6 +591,7 @@ async def _load_user(uid: str):
 
 
 async def _is_cancel_requested(run_id: str) -> bool:
+    """仅以 PostgreSQL 的 cancel_requested 状态作为取消事实，Redis 信号不构成终态依据。"""
     run = await _get_run(run_id)
     return bool(run and run.status == "cancel_requested")
 
@@ -622,6 +642,7 @@ def _is_last_try(ctx) -> bool:
 
 
 def _is_retryable_exception(exc: Exception) -> bool:
+    """区分可重试的瞬时故障与必须直接落终态的不可恢复错误。"""
     if isinstance(exc, NonRetryableRunError):
         return False
     return isinstance(exc, (RetryableRunError, OperationalError, ConnectionError, TimeoutError, asyncio.TimeoutError))
@@ -699,6 +720,7 @@ def _chunk_thread_id(chunk: dict, fallback: str | None) -> str | None:
 
 
 def _map_chunk_to_run_event(chunk: dict) -> tuple[str, dict]:
+    """把执行流 chunk 路由为可持久化的 AgentRun 事件类型与载荷。"""
     status = chunk.get("status") or "event"
     if status == "loading":
         return "messages", {"chunk": chunk}
@@ -717,6 +739,7 @@ def _map_chunk_to_run_event(chunk: dict) -> tuple[str, dict]:
 
 
 async def _append_end_event(run_id: str, status: str, *, thread_id: str | None, payload: dict | None = None):
+    """发布 best-effort 终态事件；发布失败不影响 PostgreSQL 已收敛的终态事实。"""
     end_payload = {"status": status}
     if payload:
         end_payload.update(payload)
@@ -735,6 +758,7 @@ async def _finish_run(
     error_message: str | None = None,
     publish_end: bool = True,
 ) -> TerminalTransition:
+    """收敛 Run 终态：先写 PostgreSQL 终态，再释放 runtime，最后发布 end 事件。"""
     run = await _get_run(run_id)
     token_usage = {"available": False}
     if thread_id:
@@ -745,6 +769,7 @@ async def _finish_run(
         )
         if state_token_usage is not None:
             token_usage = state_token_usage
+    # 终态事务先行；只有在 PG 收敛成功后才释放 runtime 与发布 end 事件。
     transition = await mark_run_terminal(
         run_id,
         status,
@@ -754,6 +779,7 @@ async def _finish_run(
         worker_id=worker_id,
     )
     if transition.status in TERMINAL_RUN_STATUSES:
+        # 终态可见前必须释放 runtime，避免客户端撞上随后发生的删除。
         committed_run = await _get_run(run_id)
         await _release_runtime_before_terminal_event(committed_run or run)
     if publish_end and transition.changed and transition.status:
@@ -851,9 +877,11 @@ async def process_agent_run(ctx, run_id: str):
         await _finish_execution_tree_children(run)
         cleanup_was_pending = bool(getattr(run, "runtime_cleanup_pending", False))
         if cleanup_was_pending:
+            # 重试到达时 Run 已终态但 runtime cleanup 尚未闭合；保持重试语义直到 cleanup 完成。
             await _require_runtime_cleanup(run, f"Run {run_id} 的 execution tree 尚未完成 runtime cleanup")
             await _append_end_event(run_id, run.status, thread_id=run.conversation_thread_id)
         if run.status == "completed":
+            # 队头完成才解锁线程 FIFO 队列的下一个请求。
             await dispatch_next_request(
                 uid=run.uid,
                 agent_slug=run.agent_slug,
@@ -868,8 +896,10 @@ async def process_agent_run(ctx, run_id: str):
         if run is None:
             raise NonRetryableRunError(f"Run {run_id} 在 runtime cleanup 后不存在")
 
+    # claim 当前 Run 的执行 ownership；唯一 owner token 防止并发 attempt 越权。
     worker_id = _run_owner_token(ctx)
     if not await mark_run_running(run_id, worker_id):
+        # 失败说明已被其他 owner 持有或已终态；静默退出，过期 lease 由 reconciler 收敛。
         logger.info(f"Run lease is owned elsewhere or expired, skip: {run_id}")
         return
 
@@ -888,6 +918,7 @@ async def process_agent_run(ctx, run_id: str):
     )
     model_request_recorder = FirstModelRequestRecorder()
     try:
+        # 两段式取消第一段：执行前先查 PG 取消事实，避免把已取消的 Run 启动构图。
         if await _is_cancel_requested(run_id):
             run_ctx.cancel_event.set()
             raise asyncio.CancelledError(f"run {run_id} cancelled before execution")
@@ -1292,8 +1323,10 @@ async def process_agent_run(ctx, run_id: str):
         await model_request_recorder.persist(run_id=run_id, worker_id=worker_id)
         await _flush_writer_best_effort(writer)
         if run_ctx.lease_lost:
+            # lease 失守不在此收敛终态，留给 reconciler 显式 fail(worker_lease_expired)。
             logger.warning(f"Run stopped after losing its lease: {run_id}")
             return
+        # 两段式取消第二段：先确认真用户取消，由当前 owner 直接收敛 cancelled 终态。
         if await _confirmed_user_cancel(run_id):
             transition = await _finish_user_cancel(
                 run_id=run_id,
@@ -1307,11 +1340,13 @@ async def process_agent_run(ctx, run_id: str):
             logger.info(f"Run user cancellation settled: run={run_id}, changed={transition.changed}")
             return
 
+        # 非用户取消（如 ARQ abort / 进程取消）：释放 lease 让重试接管，避免遗留活跃 Run。
         try:
             released = await release_run_lease_for_retry(run_id, worker_id)
         except Exception:
             logger.error(f"Infrastructure cancellation could not release AgentRun lease: run={run_id}", exc_info=True)
             raise cancellation
+        # release 失败时再次确认用户取消，覆盖 release 与 cancel 的并发竞态。
         if not released and await _confirmed_user_cancel(run_id):
             transition = await _finish_user_cancel(
                 run_id=run_id,
@@ -1373,6 +1408,7 @@ async def process_agent_run(ctx, run_id: str):
                 "retryable": True,
                 "job_try": job_try,
             }
+            # 瞬时故障期间用户可能并发取消；先把 PG cancel 视为最高优先级事实收敛 cancelled。
             if await _confirmed_user_cancel(run_id):
                 await _finish_user_cancel(
                     run_id=run_id,
@@ -1384,6 +1420,7 @@ async def process_agent_run(ctx, run_id: str):
                     run=run,
                 )
                 return
+            # 重试用尽后不再重投队列，直接落 failed 终态并发布 end 事件。
             if _is_last_try(ctx):
                 transition = await _finish_run(
                     run_id,
@@ -1412,6 +1449,7 @@ async def process_agent_run(ctx, run_id: str):
                 logger.error(f"Run failed after retries exhausted {run_id}: {e}")
                 return
 
+            # 还可重试：释放 lease 与 runtime cleanup，让下一次 attempt 用新 owner token 接管。
             if not await release_run_lease_for_retry(run_id, worker_id):
                 if await _confirmed_user_cancel(run_id):
                     await _finish_user_cancel(
@@ -1435,6 +1473,7 @@ async def process_agent_run(ctx, run_id: str):
                 {"chunk": retryable_error_chunk, "retryable": True},
                 thread_id=thread_id,
             )
+            # 包装为 RetryableRunError 让 ARQ 走重试链路；OperationalError 等保持原类型由 ARQ 识别。
             if isinstance(e, RetryableRunError):
                 raise
             raise RetryableRunError(str(e)) from e
@@ -1507,6 +1546,7 @@ async def _reconcile_agent_run_leases_forever() -> None:
             cleaned_ids = await reconcile_pending_runtime_cleanups()
             if cleaned_ids:
                 logger.warning(f"Reconciled pending runtime cleanups: count={len(cleaned_ids)}")
+            # 同一轮内补发持久 pending dispatch 与到期 scheduled job，保证 worker 故障期间不丢投递。
             await recover_pending_dispatches()
             await recover_scheduled_dispatches()
             await claim_and_dispatch_due_jobs()
@@ -1581,6 +1621,7 @@ async def _worker_startup(ctx):
         )
     async with pg_manager.get_async_session_context() as session:
         await init_builtin_skills(session)
+    # 启动时先跑一轮 reconciliation：把失联 Run、未闭合 cleanup 与 pending dispatch 全部收敛，再开始接 ARQ 任务。
     reconciled_ids = await reconcile_expired_run_leases()
     if reconciled_ids:
         logger.warning(f"Reconciled expired AgentRun leases at startup: count={len(reconciled_ids)}")
@@ -1615,6 +1656,8 @@ async def _worker_shutdown(ctx):
 
 
 class WorkerSettings:
+    """ARQ worker 注册入口：声明可执行函数、并发上限、重试策略与 startup/shutdown 钩子。"""
+
     functions = [
         process_agent_run,
         func(process_task, timeout=TASKER_DEFAULT_TIMEOUT_SECONDS + 30),
